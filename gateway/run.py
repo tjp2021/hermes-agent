@@ -363,6 +363,46 @@ def _load_gateway_config() -> dict:
     return {}
 
 
+def _normalize_lane_mapping_entry(entry: dict, source: SessionSource | None = None) -> dict | None:
+    """Normalize a config-driven lane mapping for a chat/thread."""
+    if not isinstance(entry, dict):
+        return None
+
+    chat_id = str(entry.get("chat_id", "")).strip()
+    if not chat_id:
+        return None
+
+    source_chat_id = str(getattr(source, "chat_id", "")).strip() if source else ""
+    if source_chat_id and chat_id != source_chat_id:
+        return None
+
+    thread_id = entry.get("thread_id")
+    if thread_id is not None:
+        thread_id = str(thread_id).strip() or None
+
+    if source is not None and thread_id is not None:
+        source_thread_id = str(getattr(source, "thread_id", "") or "").strip() or None
+        if thread_id != source_thread_id:
+            return None
+
+    cwd = str(entry.get("cwd", "")).strip()
+    if cwd:
+        cwd = os.path.abspath(os.path.expanduser(cwd))
+    else:
+        cwd = None
+
+    name = str(entry.get("name", "")).strip() or None
+    prompt = str(entry.get("prompt", "")).strip() or None
+
+    return {
+        "chat_id": chat_id,
+        "thread_id": thread_id,
+        "name": name,
+        "cwd": cwd,
+        "prompt": prompt,
+    }
+
+
 def _resolve_gateway_model(config: dict | None = None) -> str:
     """Read model from env/config — mirrors the resolution in _run_agent_sync.
 
@@ -2072,6 +2112,8 @@ class GatewayRunner:
         # Get or create session
         session_entry = self.session_store.get_or_create_session(source)
         session_key = session_entry.session_key
+        lane_mapping = self._resolve_lane_mapping(source)
+        lane_cwd = lane_mapping.get("cwd") if lane_mapping else None
         
         # Emit session:start for new or auto-reset sessions
         _is_new_session = (
@@ -2104,6 +2146,9 @@ class GatewayRunner:
 
         # Build the context prompt to inject
         context_prompt = build_session_context_prompt(context, redact_pii=_redact_pii)
+        lane_prompt = self._build_lane_prompt(lane_mapping)
+        if lane_prompt:
+            context_prompt = f"{context_prompt}\n\n{lane_prompt}".strip()
         
         # If the previous session expired and was auto-reset, prepend a notice
         # so the agent knows this is a fresh conversation (not an intentional /reset).
@@ -2640,7 +2685,7 @@ class GatewayRunner:
                 try:
                     from agent.context_references import preprocess_context_references_async
                     from agent.model_metadata import get_model_context_length
-                    _msg_cwd = os.environ.get("MESSAGING_CWD", os.path.expanduser("~"))
+                    _msg_cwd = lane_cwd or os.environ.get("MESSAGING_CWD", os.path.expanduser("~"))
                     _msg_ctx_len = get_model_context_length(
                         self._model, base_url=self._base_url or "")
                     _ctx_result = await preprocess_context_references_async(
@@ -2668,6 +2713,7 @@ class GatewayRunner:
                 session_id=session_entry.session_id,
                 session_key=session_key,
                 event_message_id=event.message_id,
+                lane_cwd=lane_cwd,
             )
 
             # Stop persistent typing indicator now that the agent is done
@@ -3889,7 +3935,8 @@ class GatewayRunner:
             max_snapshots=cp_cfg.get("max_snapshots", 50),
         )
 
-        cwd = os.getenv("MESSAGING_CWD", str(Path.home()))
+        lane_mapping = self._resolve_lane_mapping(event.source)
+        cwd = (lane_mapping or {}).get("cwd") or os.getenv("MESSAGING_CWD", str(Path.home()))
         arg = event.get_command_args().strip()
 
         if not arg:
@@ -4003,6 +4050,7 @@ class GatewayRunner:
                     platform=platform_key,
                     session_db=self._session_db,
                     fallback_model=self._fallback_model,
+                    context_cwd=lane_cwd,
                 )
 
                 return agent.run_conversation(
@@ -4863,6 +4911,39 @@ class GatewayRunner:
             if var in os.environ:
                 del os.environ[var]
     
+    def _resolve_lane_mapping(self, source: SessionSource) -> dict | None:
+        """Resolve the configured lane binding for this source chat/thread."""
+        if not source or not getattr(self, "config", None):
+            return None
+
+        platform_cfg = self.config.platforms.get(source.platform)
+        if not platform_cfg or not isinstance(getattr(platform_cfg, "extra", None), dict):
+            return None
+
+        lane_mappings = platform_cfg.extra.get("lane_mappings", [])
+        if not isinstance(lane_mappings, list):
+            return None
+
+        for entry in lane_mappings:
+            normalized = _normalize_lane_mapping_entry(entry, source)
+            if normalized:
+                return normalized
+        return None
+
+    def _build_lane_prompt(self, lane_mapping: dict | None) -> str:
+        """Build a prompt fragment describing the active lane binding."""
+        if not lane_mapping:
+            return ""
+
+        lines = ["## Lane Binding", ""]
+        if lane_mapping.get("name"):
+            lines.append(f"**Lane:** {lane_mapping['name']}")
+        if lane_mapping.get("cwd"):
+            lines.append(f"**Workspace CWD:** {lane_mapping['cwd']}")
+        if lane_mapping.get("prompt"):
+            lines.extend(["", lane_mapping["prompt"]])
+        return "\n".join(lines).strip()
+
     async def _enrich_message_with_vision(
         self,
         user_text: str,
@@ -5168,6 +5249,7 @@ class GatewayRunner:
         session_key: str = None,
         _interrupt_depth: int = 0,
         event_message_id: Optional[str] = None,
+        lane_cwd: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Run the agent with the given message and context.
@@ -5452,6 +5534,9 @@ class GatewayRunner:
             honcho_manager, honcho_config = self._get_or_create_gateway_honcho(session_key)
             reasoning_config = self._load_reasoning_config()
             self._reasoning_config = reasoning_config
+            if lane_cwd:
+                from tools import register_task_env_overrides
+                register_task_env_overrides(session_id, {"cwd": lane_cwd})
             # Set up streaming consumer if enabled
             _stream_consumer = None
             _stream_delta_cb = None
@@ -5527,6 +5612,7 @@ class GatewayRunner:
                     honcho_config=honcho_config,
                     session_db=self._session_db,
                     fallback_model=self._fallback_model,
+                    context_cwd=lane_cwd,
                 )
                 if _cache_lock and _cache is not None:
                     with _cache_lock:
@@ -5537,6 +5623,7 @@ class GatewayRunner:
             # turn and must not be baked into the cached agent constructor.
             agent.tool_progress_callback = progress_callback if tool_progress_enabled else None
             agent.step_callback = _step_callback_sync if _hooks_ref.loaded_hooks else None
+            agent.context_cwd = lane_cwd
             agent.stream_delta_callback = _stream_delta_cb
             agent.status_callback = _status_callback_sync
             agent.reasoning_config = reasoning_config
@@ -5895,6 +5982,7 @@ class GatewayRunner:
                     session_id=session_id,
                     session_key=session_key,
                     _interrupt_depth=_interrupt_depth + 1,
+                    lane_cwd=lane_cwd,
                 )
         finally:
             # Stop progress sender and interrupt monitor
@@ -5925,6 +6013,13 @@ class GatewayRunner:
                         await task
                     except asyncio.CancelledError:
                         pass
+
+            if lane_cwd:
+                try:
+                    from tools import clear_task_env_overrides
+                    clear_task_env_overrides(session_id)
+                except Exception:
+                    pass
 
         # If streaming already delivered the response, mark it so the
         # caller's send() is skipped (avoiding duplicate messages).

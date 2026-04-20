@@ -41,7 +41,7 @@ import time
 import uuid
 
 _IS_WINDOWS = platform.system() == "Windows"
-from tools.environments.local import _find_shell, _sanitize_subprocess_env
+from tools.environments.local import _find_shell, _sanitize_subprocess_env, _resolve_local_cwd
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
@@ -141,12 +141,13 @@ class ProcessRegistry:
                      CLI tools (Codex, Claude Code, Python REPL). Falls back to
                      subprocess.Popen if ptyprocess is not installed.
         """
+        resolved_cwd = _resolve_local_cwd(cwd) or os.getcwd()
         session = ProcessSession(
             id=f"proc_{uuid.uuid4().hex[:12]}",
             command=command,
             task_id=task_id,
             session_key=session_key,
-            cwd=cwd or os.getcwd(),
+            cwd=resolved_cwd,
             started_at=time.time(),
         )
 

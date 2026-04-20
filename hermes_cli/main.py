@@ -2642,7 +2642,7 @@ def _update_via_zip(args):
     print("✓ Update complete!")
 
 
-def _stash_local_changes_if_needed(git_cmd: list[str], cwd: Path) -> Optional[str]:
+def _get_local_change_lines(git_cmd: list[str], cwd: Path) -> list[str]:
     status = subprocess.run(
         git_cmd + ["status", "--porcelain"],
         cwd=cwd,
@@ -2650,7 +2650,13 @@ def _stash_local_changes_if_needed(git_cmd: list[str], cwd: Path) -> Optional[st
         text=True,
         check=True,
     )
-    if not status.stdout.strip():
+    return [line for line in status.stdout.splitlines() if line.strip()]
+
+
+
+def _stash_local_changes_if_needed(git_cmd: list[str], cwd: Path) -> Optional[str]:
+    status_lines = _get_local_change_lines(git_cmd, cwd)
+    if not status_lines:
         return None
 
     from datetime import datetime, timezone
@@ -2670,6 +2676,46 @@ def _stash_local_changes_if_needed(git_cmd: list[str], cwd: Path) -> Optional[st
         check=True,
     ).stdout.strip()
     return stash_ref
+
+
+
+def _require_safe_update_state(
+    git_cmd: list[str],
+    cwd: Path,
+    *,
+    current_branch: str,
+    allow_dirty: bool = False,
+    allow_branch_switch: bool = False,
+) -> None:
+    if current_branch != "main" and not allow_branch_switch:
+        label = "detached HEAD" if current_branch == "HEAD" else f"branch '{current_branch}'"
+        print(f"✗ Refusing to update from {label}.")
+        print("  Hermes update only updates main by default.")
+        print("  This protects custom branches from being silently switched/stashed during update.")
+        print()
+        print("  Do one of these:")
+        print("    1) Update main intentionally: git checkout main && hermes update")
+        print("    2) Push/save your branch work first, then update main")
+        print("    3) Override once with: hermes update --allow-branch-switch")
+        sys.exit(1)
+
+    status_lines = _get_local_change_lines(git_cmd, cwd)
+    if status_lines and not allow_dirty:
+        print("✗ Refusing to update with local changes in the Hermes repo.")
+        print("  Hermes update now requires a clean working tree by default.")
+        print()
+        print("  Local changes detected:")
+        for line in status_lines[:20]:
+            print(f"    {line}")
+        if len(status_lines) > 20:
+            print(f"    ... and {len(status_lines) - 20} more")
+        print()
+        print("  Do one of these:")
+        print("    1) Commit the changes")
+        print("    2) Stash them manually: git stash push --include-untracked -m 'manual-pre-update'")
+        print("    3) Discard them if they are junk: git reset --hard HEAD && git clean -fd")
+        print("    4) Override once with: hermes update --allow-dirty")
+        sys.exit(1)
 
 
 
@@ -2887,14 +2933,20 @@ def cmd_update(args):
         )
         current_branch = result.stdout.strip()
 
+        _require_safe_update_state(
+            git_cmd,
+            PROJECT_ROOT,
+            current_branch=current_branch,
+            allow_dirty=getattr(args, "allow_dirty", False),
+            allow_branch_switch=getattr(args, "allow_branch_switch", False),
+        )
+
         # Always update against main
         branch = "main"
-
-        # If user is on a non-main branch or detached HEAD, switch to main
-        if current_branch != "main":
-            label = "detached HEAD" if current_branch == "HEAD" else f"branch '{current_branch}'"
-            print(f"  ⚠ Currently on {label} — switching to main for update...")
-            # Stash before checkout so uncommitted work isn't lost
+        auto_stash_ref = None
+        if current_branch != "main" and getattr(args, "allow_branch_switch", False):
+            label = "detached HEAD" if current_branch == "HEAD" else current_branch
+            print(f"  ⚠ Override enabled — switching from {label} to main for update...")
             auto_stash_ref = _stash_local_changes_if_needed(git_cmd, PROJECT_ROOT)
             subprocess.run(
                 git_cmd + ["checkout", "main"],
@@ -2903,7 +2955,7 @@ def cmd_update(args):
                 text=True,
                 check=True,
             )
-        else:
+        elif getattr(args, "allow_dirty", False):
             auto_stash_ref = _stash_local_changes_if_needed(git_cmd, PROJECT_ROOT)
 
         prompt_for_restore = auto_stash_ref is not None and sys.stdin.isatty() and sys.stdout.isatty()
@@ -4725,6 +4777,16 @@ For more help on a command:
         "update",
         help="Update Hermes Agent to the latest version",
         description="Pull the latest changes from git and reinstall dependencies"
+    )
+    update_parser.add_argument(
+        "--allow-dirty",
+        action="store_true",
+        help="Override the clean-working-tree requirement for this update only",
+    )
+    update_parser.add_argument(
+        "--allow-branch-switch",
+        action="store_true",
+        help="Override the main-branch requirement for this update only",
     )
     update_parser.set_defaults(func=cmd_update)
     
