@@ -269,6 +269,13 @@ _SANE_PATH = (
 )
 
 
+def _resolve_local_cwd(cwd: str | None) -> str | None:
+    """Expand local cwd values like ~/project to real host paths."""
+    if not cwd:
+        return cwd
+    return os.path.abspath(os.path.expanduser(cwd))
+
+
 def _make_run_env(env: dict) -> dict:
     """Build a run environment with a sane PATH and provider-var stripping."""
     try:
@@ -328,7 +335,8 @@ class LocalEnvironment(PersistentShellMixin, BaseEnvironment):
 
     def __init__(self, cwd: str = "", timeout: int = 60, env: dict = None,
                  persistent: bool = False):
-        super().__init__(cwd=cwd or os.getcwd(), timeout=timeout, env=env)
+        resolved_cwd = _resolve_local_cwd(cwd) or os.getcwd()
+        super().__init__(cwd=resolved_cwd, timeout=timeout, env=env)
         self.persistent = persistent
         if self.persistent:
             self._init_persistent_shell()
@@ -379,7 +387,7 @@ class LocalEnvironment(PersistentShellMixin, BaseEnvironment):
     def _execute_oneshot(self, command: str, cwd: str = "", *,
                          timeout: int | None = None,
                          stdin_data: str | None = None) -> dict:
-        work_dir = cwd or self.cwd or os.getcwd()
+        work_dir = _resolve_local_cwd(cwd) or self.cwd or os.getcwd()
         effective_timeout = timeout or self.timeout
         exec_command, sudo_stdin = self._prepare_command(command)
 

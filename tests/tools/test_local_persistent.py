@@ -43,6 +43,18 @@ class TestMergeOutput:
 
 
 class TestLocalOneShotRegression:
+    def test_constructor_expands_tilde_cwd(self, monkeypatch, tmp_path):
+        home = tmp_path / "home"
+        project = home / "project"
+        project.mkdir(parents=True)
+        monkeypatch.setenv("HOME", str(home))
+
+        env = LocalEnvironment(cwd="~/project", persistent=False)
+        try:
+            assert env.cwd == str(project)
+        finally:
+            env.cleanup()
+
     def test_echo(self):
         env = LocalEnvironment(persistent=False)
         r = env.execute("echo hello")
@@ -62,6 +74,20 @@ class TestLocalOneShotRegression:
         r = env.execute("echo $HERMES_ONESHOT_LOCAL")
         assert r["output"].strip() == ""
         env.cleanup()
+
+    def test_tilde_cwd_expands_for_oneshot_execution(self, monkeypatch, tmp_path):
+        home = tmp_path / "home"
+        project = home / "project"
+        project.mkdir(parents=True)
+        monkeypatch.setenv("HOME", str(home))
+
+        env = LocalEnvironment(cwd=str(tmp_path), persistent=False)
+        try:
+            r = env.execute("pwd", cwd="~/project")
+            assert r["returncode"] == 0
+            assert r["output"].strip() == str(project)
+        finally:
+            env.cleanup()
 
     def test_oneshot_heredoc_does_not_leak_fence_wrapper(self):
         """Heredoc closing line must not be merged with the fence wrapper tail."""
@@ -97,6 +123,20 @@ class TestLocalPersistent:
         env.execute("cd /tmp")
         r = env.execute("pwd")
         assert r["output"].strip() == "/tmp"
+
+    def test_tilde_cwd_expands_for_persistent_execution(self, monkeypatch, tmp_path):
+        home = tmp_path / "home"
+        project = home / "project"
+        project.mkdir(parents=True)
+        monkeypatch.setenv("HOME", str(home))
+
+        env = LocalEnvironment(cwd=str(tmp_path), persistent=True)
+        try:
+            r = env.execute("pwd", cwd="~/project")
+            assert r["returncode"] == 0
+            assert r["output"].strip() == str(project)
+        finally:
+            env.cleanup()
 
     def test_exit_code(self, env):
         r = env.execute("(exit 42)")

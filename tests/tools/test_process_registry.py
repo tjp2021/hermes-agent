@@ -262,6 +262,37 @@ class TestSpawnEnvSanitization:
         assert f"{_HERMES_PROVIDER_ENV_FORCE_PREFIX}TELEGRAM_BOT_TOKEN" not in env
         assert env["PYTHONUNBUFFERED"] == "1"
 
+    def test_spawn_local_expands_tilde_cwd(self, registry, tmp_path):
+        captured = {}
+        home = tmp_path / "home"
+        project = home / "project"
+        project.mkdir(parents=True)
+
+        def fake_popen(cmd, **kwargs):
+            captured["cwd"] = kwargs["cwd"]
+            proc = MagicMock()
+            proc.pid = 4321
+            proc.stdout = iter([])
+            proc.stdin = MagicMock()
+            proc.poll.return_value = None
+            return proc
+
+        fake_thread = MagicMock()
+
+        with patch.dict(os.environ, {
+            "PATH": "/usr/bin:/bin",
+            "HOME": str(home),
+            "USER": "tester",
+        }, clear=True), \
+            patch("tools.process_registry._find_shell", return_value="/bin/bash"), \
+            patch("subprocess.Popen", side_effect=fake_popen), \
+            patch("threading.Thread", return_value=fake_thread), \
+            patch.object(registry, "_write_checkpoint"):
+            session = registry.spawn_local("echo hello", cwd="~/project")
+
+        assert session.cwd == str(project)
+        assert captured["cwd"] == str(project)
+
 
 # =========================================================================
 # Checkpoint

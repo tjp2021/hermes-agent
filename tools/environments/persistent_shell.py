@@ -1,6 +1,7 @@
-"""Persistent shell mixin: file-based IPC protocol for long-lived bash shells."""
+"""Shared persistent-shell mixin for Local/SSH environments."""
 
 import logging
+import os
 import shlex
 import subprocess
 import threading
@@ -11,6 +12,12 @@ from abc import abstractmethod
 from tools.interrupt import is_interrupted
 
 logger = logging.getLogger(__name__)
+
+
+def _resolve_shell_cwd(cwd: str | None) -> str | None:
+    if not cwd:
+        return cwd
+    return os.path.abspath(os.path.expanduser(cwd))
 
 
 class PersistentShellMixin:
@@ -206,7 +213,7 @@ class PersistentShellMixin:
 
     def _execute_persistent_locked(self, command: str, cwd: str,
                                    timeout: int) -> dict:
-        work_dir = cwd or self.cwd
+        work_dir = _resolve_shell_cwd(cwd) or self.cwd
         cmd_id = uuid.uuid4().hex[:8]
         truncate = (
             f": > {self._pshell_stdout}\n"
