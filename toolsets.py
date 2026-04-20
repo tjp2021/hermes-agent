@@ -52,6 +52,8 @@ _HERMES_CORE_TOOLS = [
     "session_search",
     # Clarifying questions
     "clarify",
+    # Paul-loop primitives (opt-in via paul-loop personality)
+    "ask_user", "rubber_duck",
     # Code execution + delegation
     "execute_code", "delegate_task",
     # Cronjob management
@@ -178,6 +180,18 @@ TOOLSETS = {
     "clarify": {
         "description": "Ask the user clarifying questions (multiple-choice or open-ended)",
         "tools": ["clarify"],
+        "includes": []
+    },
+
+    "ask_user": {
+        "description": "Mandatory turn-end user checkpoint (paul-loop primitive)",
+        "tools": ["ask_user"],
+        "includes": []
+    },
+
+    "rubber_duck": {
+        "description": "Parallel multi-model critique loop for every unit of work (paul-loop primitive)",
+        "tools": ["rubber_duck"],
         "includes": []
     },
     

@@ -4201,6 +4201,35 @@ class AIAgent:
             # Fallback to hardcoded identity
             prompt_parts = [DEFAULT_AGENT_IDENTITY]
 
+        # -- paul-loop task-state injection (Primitive 4) ------------------
+        # When the paul-loop personality is active (detected via its
+        # sentinel in the ephemeral_system_prompt), inject the durable
+        # <cwd>/.hermes/task-state.md near the top of the prompt so the
+        # agent always rehydrates state, even after compaction.
+        try:
+            from agent.task_state import (
+                is_paul_loop_active as _is_paul_loop,
+                read_task_state as _read_ts,
+            )
+            if _is_paul_loop(getattr(self, "ephemeral_system_prompt", "") or ""):
+                _ts_cwd = os.getenv("TERMINAL_CWD") or os.getcwd()
+                _ts_content = _read_ts(_ts_cwd)
+                if not _ts_content.strip():
+                    _ts_content = (
+                        "(empty) — Write durable state here via "
+                        "agent.task_state.write_task_state(cwd, content). "
+                        "Include: todo list, current unit, rubber-duck round, "
+                        "last ask_user answer. This file survives context compaction."
+                    )
+                prompt_parts.append(
+                    "=== TASK STATE (durable, survives compaction) ===\n"
+                    f"{_ts_content}\n"
+                    "=== END TASK STATE ==="
+                )
+        except Exception as _ts_exc:
+            logger.debug("paul-loop task-state injection skipped: %s", _ts_exc)
+        # -----------------------------------------------------------------
+
         # Tool-aware behavioral guidance: only inject when the tools are loaded
         tool_guidance = []
         if "memory" in self.valid_tool_names:
@@ -7803,6 +7832,30 @@ class AIAgent:
         if todo_snapshot:
             compressed.append({"role": "user", "content": todo_snapshot})
 
+        # -- paul-loop post-compression re-anchor (Primitive 5) ------------
+        # After compression drops mid-conversation context, re-inject the
+        # paul-loop rules verbatim so the operator constraints survive a
+        # lossy summary. Opt-in via the sentinel in ephemeral_system_prompt.
+        try:
+            from agent.task_state import (
+                is_paul_loop_active as _is_paul_loop,
+                PAUL_LOOP_RULES as _PAUL_LOOP_RULES,
+            )
+            if _is_paul_loop(getattr(self, "ephemeral_system_prompt", "") or ""):
+                compressed.append({
+                    "role": "user",
+                    "content": (
+                        "=== PAUL-LOOP RE-ANCHOR (post-compression) ===\n"
+                        f"{_PAUL_LOOP_RULES}"
+                        "=== END PAUL-LOOP RE-ANCHOR ===\n"
+                        "Re-read .hermes/task-state.md before your next action."
+                    ),
+                })
+        except Exception as _pl_exc:
+            logger.debug("paul-loop re-anchor skipped: %s", _pl_exc)
+        # -----------------------------------------------------------------
+
+
         self._invalidate_system_prompt()
         new_system_prompt = self._build_system_prompt(system_message)
         self._cached_system_prompt = new_system_prompt
@@ -7980,6 +8033,23 @@ class AIAgent:
                 question=function_args.get("question", ""),
                 choices=function_args.get("choices"),
                 callback=self.clarify_callback,
+            )
+        elif function_name == "ask_user":
+            from tools.ask_user import ask_user_tool as _ask_user_tool
+            self._paul_loop_ask_user_called_this_turn = True
+            return _ask_user_tool(
+                message=function_args.get("message", ""),
+                callback=self.clarify_callback,
+            )
+        elif function_name == "rubber_duck":
+            from tools.rubber_duck import rubber_duck as _rubber_duck
+            return _rubber_duck(
+                artifact=function_args.get("artifact", ""),
+                unit_description=function_args.get("unit_description", ""),
+                critics=function_args.get("critics"),
+                max_rounds=function_args.get("max_rounds"),
+                round=function_args.get("round"),
+                parent_agent=self,
             )
         elif function_name == "delegate_task":
             return self._dispatch_delegate_task(function_args)
@@ -8495,6 +8565,30 @@ class AIAgent:
                 tool_duration = time.time() - tool_start_time
                 if self._should_emit_quiet_tool_messages():
                     self._vprint(f"  {_get_cute_tool_message_impl('clarify', function_args, tool_duration, result=function_result)}")
+            elif function_name == "ask_user":
+                from tools.ask_user import ask_user_tool as _ask_user_tool
+                function_result = _ask_user_tool(
+                    message=function_args.get("message", ""),
+                    callback=self.clarify_callback,
+                )
+                # paul-loop turn-end enforcement tracking
+                self._paul_loop_ask_user_called_this_turn = True
+                tool_duration = time.time() - tool_start_time
+                if self._should_emit_quiet_tool_messages():
+                    self._vprint(f"  🙋 asked user: {function_args.get('message', '')[:60]}  ({tool_duration:.1f}s)")
+            elif function_name == "rubber_duck":
+                from tools.rubber_duck import rubber_duck as _rubber_duck
+                function_result = _rubber_duck(
+                    artifact=function_args.get("artifact", ""),
+                    unit_description=function_args.get("unit_description", ""),
+                    critics=function_args.get("critics"),
+                    max_rounds=function_args.get("max_rounds"),
+                    round=function_args.get("round"),
+                    parent_agent=self,
+                )
+                tool_duration = time.time() - tool_start_time
+                if self._should_emit_quiet_tool_messages():
+                    self._vprint(f"  🦆 rubber_duck round — unit={function_args.get('unit_description', '')[:40]}  ({tool_duration:.1f}s)")
             elif function_name == "delegate_task":
                 tasks_arg = function_args.get("tasks")
                 if tasks_arg and isinstance(tasks_arg, list):
@@ -8954,6 +9048,19 @@ class AIAgent:
         self._mute_post_response = False
         self._unicode_sanitization_passes = 0
 
+        # -- paul-loop per-turn enforcement state (Primitive 3/5) --------
+        # Track whether the agent called ask_user this turn. The text-response
+        # path consults this before declaring the turn complete.
+        self._paul_loop_ask_user_called_this_turn = False
+        self._paul_loop_enforcement_retries = 0
+        try:
+            from agent.task_state import is_paul_loop_active as _is_pl
+            self._paul_loop_active = bool(_is_pl(self.ephemeral_system_prompt or ""))
+        except Exception:
+            self._paul_loop_active = False
+        # Increment per-turn counter for sticky-reminder cadence.
+        self._paul_loop_turn_count = getattr(self, "_paul_loop_turn_count", 0) + 1
+
         # Pre-turn connection health check: detect and clean up dead TCP
         # connections left over from provider outages or dropped streams.
         # This prevents the next API call from hanging on a zombie socket.
@@ -9240,6 +9347,30 @@ class AIAgent:
         while (api_call_count < self.max_iterations and self.iteration_budget.remaining > 0) or self._budget_grace_call:
             # Reset per-turn checkpoint dedup so each iteration can take one snapshot
             self._checkpoint_mgr.new_turn()
+
+            # -- paul-loop sticky reminder (Primitive 5) -------------------
+            # Every 5 iterations under paul-loop, inject a short user-role
+            # reminder so operator rules survive long tool chains. This does
+            # NOT mutate the system prompt (cache-safe).
+            if (
+                getattr(self, "_paul_loop_active", False)
+                and api_call_count > 0
+                and api_call_count % 5 == 0
+                and (not messages or not (
+                    isinstance(messages[-1], dict)
+                    and messages[-1].get("role") == "user"
+                    and "paul-loop active" in (messages[-1].get("content") or "")
+                ))
+            ):
+                messages.append({
+                    "role": "user",
+                    "content": (
+                        "REMINDER: paul-loop active — end turn with ask_user, "
+                        "rubber-duck every unit, delegate work."
+                    ),
+                })
+            # --------------------------------------------------------------
+
 
             # Check for interrupt request (e.g., user sent new message)
             if self._interrupt_requested:
@@ -11971,7 +12102,32 @@ class AIAgent:
                         messages.pop()
 
                     messages.append(final_msg)
-                    
+
+                    # -- paul-loop turn-end enforcement (Primitive 3) --------
+                    # Under paul-loop, every turn must end with ask_user. If the
+                    # model produced a text response without invoking ask_user,
+                    # inject a corrective user message and continue the loop.
+                    # Capped at 2 retries to avoid infinite bounces.
+                    if (
+                        getattr(self, "_paul_loop_active", False)
+                        and not getattr(self, "_paul_loop_ask_user_called_this_turn", False)
+                        and getattr(self, "_paul_loop_enforcement_retries", 0) < 2
+                    ):
+                        self._paul_loop_enforcement_retries += 1
+                        messages.append({
+                            "role": "user",
+                            "content": (
+                                "paul-loop violation: you must end every turn with "
+                                "ask_user. Call ask_user now with your final question "
+                                "for the user — do not produce a plain text finale."
+                            ),
+                        })
+                        _turn_exit_reason = (
+                            f"paul_loop_enforcement_retry_{self._paul_loop_enforcement_retries}"
+                        )
+                        continue
+                    # --------------------------------------------------------
+
                     _turn_exit_reason = f"text_response(finish_reason={finish_reason})"
                     if not self.quiet_mode:
                         self._safe_print(f"🎉 Conversation completed after {api_call_count} OpenAI-compatible API call(s)")
