@@ -5696,6 +5696,102 @@ def _cmd_update_impl(args, gateway_mode: bool):
         )
         current_branch = result.stdout.strip()
 
+        # Sticky-branch override: if ~/.hermes/update-branch exists and names
+        # the current branch, rebase it onto upstream/main instead of
+        # force-switching to main. Lets user keep a personal feature branch
+        # live across `hermes update` runs without merge drama.
+        try:
+            _sticky_path = get_hermes_home() / "update-branch"
+            _sticky_branch = (
+                _sticky_path.read_text().strip() if _sticky_path.exists() else ""
+            )
+        except Exception:
+            _sticky_branch = ""
+
+        if _sticky_branch and _sticky_branch == current_branch:
+            print(f"→ Sticky branch '{current_branch}' — rebasing onto upstream/main")
+            auto_stash_ref = _stash_local_changes_if_needed(git_cmd, PROJECT_ROOT)
+            # Ensure upstream remote exists and fetch it
+            subprocess.run(
+                git_cmd + ["fetch", "upstream", "main"],
+                cwd=PROJECT_ROOT,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            rebase_result = subprocess.run(
+                git_cmd + ["rebase", "upstream/main"],
+                cwd=PROJECT_ROOT,
+                capture_output=True,
+                text=True,
+            )
+            if rebase_result.returncode != 0:
+                print("✗ Rebase onto upstream/main failed — conflicts to resolve.")
+                subprocess.run(
+                    git_cmd + ["rebase", "--abort"],
+                    cwd=PROJECT_ROOT,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                if auto_stash_ref is not None:
+                    print(f"  ℹ️  Local changes preserved in stash: {auto_stash_ref}")
+                    print("  Resolve manually: git fetch upstream && git rebase upstream/main")
+                sys.exit(1)
+            # Push rebased branch to origin so fork stays in sync
+            subprocess.run(
+                git_cmd + ["push", "--force-with-lease", "origin", current_branch],
+                cwd=PROJECT_ROOT,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            _invalidate_update_cache()
+            _clear_bytecode_cache(PROJECT_ROOT)
+            if auto_stash_ref is not None:
+                _restore_stashed_changes(
+                    git_cmd,
+                    PROJECT_ROOT,
+                    auto_stash_ref,
+                    prompt_user=(gateway_mode or (sys.stdin.isatty() and sys.stdout.isatty())),
+                    input_fn=gw_input_fn,
+                )
+            # Still run dependency/skills update below
+            print("✓ Branch rebased onto upstream/main")
+
+            # Run Python/Node dep updates inline then return — skip main-pull flow
+            print("→ Updating Python dependencies...")
+            uv_bin = shutil.which("uv")
+            if uv_bin:
+                uv_env = {**os.environ, "VIRTUAL_ENV": str(PROJECT_ROOT / "venv")}
+                _install_python_dependencies_with_optional_fallback(
+                    [uv_bin, "pip"], env=uv_env
+                )
+            else:
+                pip_cmd = [sys.executable, "-m", "pip"]
+                try:
+                    subprocess.run(pip_cmd + ["--version"], cwd=PROJECT_ROOT, check=True, capture_output=True)
+                except subprocess.CalledProcessError:
+                    subprocess.run(
+                        [sys.executable, "-m", "ensurepip", "--upgrade", "--default-pip"],
+                        cwd=PROJECT_ROOT, check=True,
+                    )
+                _install_python_dependencies_with_optional_fallback(pip_cmd)
+            try:
+                _update_node_dependencies()
+                _build_web_ui(PROJECT_ROOT / "web")
+            except Exception:
+                pass
+            print()
+            print("✓ Update complete!")
+            if gateway_mode:
+                _exit_code_path = get_hermes_home() / ".update_exit_code"
+                try:
+                    _exit_code_path.write_text("0")
+                except OSError:
+                    pass
+            return
+
         # Always update against main
         branch = "main"
 
