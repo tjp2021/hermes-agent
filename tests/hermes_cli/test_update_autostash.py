@@ -61,6 +61,75 @@ def test_resolve_stash_selector_returns_matching_entry(monkeypatch, tmp_path):
 
 
 
+def test_get_local_change_lines_returns_porcelain_lines(monkeypatch, tmp_path):
+    def fake_run(cmd, **kwargs):
+        assert cmd == ["git", "status", "--porcelain"]
+        return SimpleNamespace(stdout=" M hermes_cli/main.py\n?? notes.txt\n\n", returncode=0)
+
+    monkeypatch.setattr(hermes_main.subprocess, "run", fake_run)
+
+    assert hermes_main._get_local_change_lines(["git"], tmp_path) == [
+        " M hermes_cli/main.py",
+        "?? notes.txt",
+    ]
+
+
+
+def test_require_safe_update_state_blocks_non_main_branch_by_default(monkeypatch, tmp_path, capsys):
+    monkeypatch.setattr(hermes_main, "_get_local_change_lines", lambda *a, **kw: [])
+
+    with pytest.raises(SystemExit, match="1"):
+        hermes_main._require_safe_update_state(
+            ["git"],
+            tmp_path,
+            current_branch="fix/custom",
+        )
+
+    out = capsys.readouterr().out
+    assert "Refusing to update from branch 'fix/custom'" in out
+    assert "git checkout main && hermes update" in out
+    assert "--allow-branch-switch" in out
+
+
+
+def test_require_safe_update_state_blocks_dirty_tree_by_default(monkeypatch, tmp_path, capsys):
+    monkeypatch.setattr(
+        hermes_main,
+        "_get_local_change_lines",
+        lambda *a, **kw: [" M cli.py", "?? notes.txt"],
+    )
+
+    with pytest.raises(SystemExit, match="1"):
+        hermes_main._require_safe_update_state(
+            ["git"],
+            tmp_path,
+            current_branch="main",
+        )
+
+    out = capsys.readouterr().out
+    assert "Refusing to update with local changes" in out
+    assert "M cli.py" in out
+    assert "git stash push --include-untracked" in out
+    assert "--allow-dirty" in out
+
+
+
+def test_require_safe_update_state_allows_explicit_overrides(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        hermes_main,
+        "_get_local_change_lines",
+        lambda *a, **kw: [" M cli.py"],
+    )
+
+    hermes_main._require_safe_update_state(
+        ["git"],
+        tmp_path,
+        current_branch="fix/custom",
+        allow_dirty=True,
+        allow_branch_switch=True,
+    )
+
+
 def test_restore_stashed_changes_prompts_before_applying(monkeypatch, tmp_path, capsys):
     calls = []
 
@@ -316,6 +385,7 @@ def _setup_update_mocks(monkeypatch, tmp_path):
     """Common setup for cmd_update tests."""
     (tmp_path / ".git").mkdir()
     monkeypatch.setattr(hermes_main, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(hermes_main, "_get_local_change_lines", lambda *a, **kw: [])
     monkeypatch.setattr(hermes_main, "_stash_local_changes_if_needed", lambda *a, **kw: None)
     monkeypatch.setattr(hermes_main, "_restore_stashed_changes", lambda *a, **kw: True)
     monkeypatch.setattr(hermes_config, "get_missing_env_vars", lambda required_only=True: [])
@@ -351,7 +421,7 @@ def test_cmd_update_tries_extras_first_then_falls_back(monkeypatch, tmp_path):
 
     monkeypatch.setattr(hermes_main.subprocess, "run", fake_run)
 
-    hermes_main.cmd_update(SimpleNamespace())
+    hermes_main.cmd_update(SimpleNamespace(allow_dirty=False, allow_branch_switch=True))
 
     install_cmds = [c for c in recorded if "pip" in c and "install" in c]
     assert len(install_cmds) == 2
@@ -380,7 +450,7 @@ def test_cmd_update_succeeds_with_extras(monkeypatch, tmp_path):
 
     monkeypatch.setattr(hermes_main.subprocess, "run", fake_run)
 
-    hermes_main.cmd_update(SimpleNamespace())
+    hermes_main.cmd_update(SimpleNamespace(allow_dirty=False, allow_branch_switch=True))
 
     install_cmds = [c for c in recorded if "pip" in c and "install" in c]
     assert len(install_cmds) == 1
@@ -440,7 +510,7 @@ def test_cmd_update_falls_back_to_reset_when_ff_only_fails(monkeypatch, tmp_path
     side_effect, recorded = _make_update_side_effect(ff_only_fails=True)
     monkeypatch.setattr(hermes_main.subprocess, "run", side_effect)
 
-    hermes_main.cmd_update(SimpleNamespace())
+    hermes_main.cmd_update(SimpleNamespace(allow_dirty=False, allow_branch_switch=True))
 
     reset_calls = [c for c in recorded if "reset" in c and "--hard" in c]
     assert len(reset_calls) == 1
@@ -458,7 +528,7 @@ def test_cmd_update_no_reset_when_ff_only_succeeds(monkeypatch, tmp_path):
     side_effect, recorded = _make_update_side_effect()
     monkeypatch.setattr(hermes_main.subprocess, "run", side_effect)
 
-    hermes_main.cmd_update(SimpleNamespace())
+    hermes_main.cmd_update(SimpleNamespace(allow_dirty=False, allow_branch_switch=True))
 
     reset_calls = [c for c in recorded if "reset" in c and "--hard" in c]
     assert len(reset_calls) == 0
@@ -476,14 +546,82 @@ def test_cmd_update_switches_to_main_from_feature_branch(monkeypatch, tmp_path, 
     side_effect, recorded = _make_update_side_effect(current_branch="fix/something")
     monkeypatch.setattr(hermes_main.subprocess, "run", side_effect)
 
-    hermes_main.cmd_update(SimpleNamespace())
+    hermes_main.cmd_update(SimpleNamespace(allow_dirty=False, allow_branch_switch=True))
 
     checkout_calls = [c for c in recorded if "checkout" in c and "main" in c]
     assert len(checkout_calls) == 1
 
+
+
+def test_cmd_update_refuses_feature_branch_without_override(monkeypatch, tmp_path, capsys):
+    _setup_update_mocks(monkeypatch, tmp_path)
+
+    side_effect, recorded = _make_update_side_effect(current_branch="fix/something")
+    monkeypatch.setattr(hermes_main.subprocess, "run", side_effect)
+
+    with pytest.raises(SystemExit, match="1"):
+        hermes_main.cmd_update(SimpleNamespace(allow_dirty=False, allow_branch_switch=False))
+
+    checkout_calls = [c for c in recorded if "checkout" in c]
+    assert len(checkout_calls) == 0
     out = capsys.readouterr().out
-    assert "fix/something" in out
-    assert "switching to main" in out
+    assert "Refusing to update from branch 'fix/something'" in out
+
+
+
+def test_cmd_update_refuses_dirty_tree_without_override(monkeypatch, tmp_path, capsys):
+    _setup_update_mocks(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        hermes_main,
+        "_get_local_change_lines",
+        lambda *a, **kw: [" M cli.py"],
+    )
+
+    side_effect, recorded = _make_update_side_effect(current_branch="main")
+    monkeypatch.setattr(hermes_main.subprocess, "run", side_effect)
+
+    with pytest.raises(SystemExit, match="1"):
+        hermes_main.cmd_update(SimpleNamespace(allow_dirty=False, allow_branch_switch=False))
+
+    pull_calls = [c for c in recorded if "pull" in c]
+    assert len(pull_calls) == 0
+    out = capsys.readouterr().out
+    assert "Refusing to update with local changes" in out
+
+
+
+def test_cmd_update_allows_branch_switch_override(monkeypatch, tmp_path):
+    _setup_update_mocks(monkeypatch, tmp_path)
+    monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/uv" if name == "uv" else None)
+
+    side_effect, recorded = _make_update_side_effect(current_branch="fix/something")
+    monkeypatch.setattr(hermes_main.subprocess, "run", side_effect)
+
+    hermes_main.cmd_update(SimpleNamespace(allow_dirty=False, allow_branch_switch=True))
+
+    checkout_calls = [c for c in recorded if "checkout" in c and "main" in c]
+    assert len(checkout_calls) == 1
+    pull_calls = [c for c in recorded if "pull" in c]
+    assert len(pull_calls) == 1
+
+
+
+def test_cmd_update_allows_dirty_override(monkeypatch, tmp_path):
+    _setup_update_mocks(monkeypatch, tmp_path)
+    monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/uv" if name == "uv" else None)
+    monkeypatch.setattr(
+        hermes_main,
+        "_get_local_change_lines",
+        lambda *a, **kw: [" M cli.py"],
+    )
+
+    side_effect, recorded = _make_update_side_effect(current_branch="main")
+    monkeypatch.setattr(hermes_main.subprocess, "run", side_effect)
+
+    hermes_main.cmd_update(SimpleNamespace(allow_dirty=True, allow_branch_switch=False))
+
+    pull_calls = [c for c in recorded if "pull" in c]
+    assert len(pull_calls) == 1
 
 
 def test_cmd_update_switches_to_main_from_detached_head(monkeypatch, tmp_path, capsys):
@@ -494,7 +632,7 @@ def test_cmd_update_switches_to_main_from_detached_head(monkeypatch, tmp_path, c
     side_effect, recorded = _make_update_side_effect(current_branch="HEAD")
     monkeypatch.setattr(hermes_main.subprocess, "run", side_effect)
 
-    hermes_main.cmd_update(SimpleNamespace())
+    hermes_main.cmd_update(SimpleNamespace(allow_dirty=False, allow_branch_switch=True))
 
     checkout_calls = [c for c in recorded if "checkout" in c and "main" in c]
     assert len(checkout_calls) == 1
@@ -524,7 +662,7 @@ def test_cmd_update_restores_stash_and_branch_when_already_up_to_date(monkeypatc
     )
     monkeypatch.setattr(hermes_main.subprocess, "run", side_effect)
 
-    hermes_main.cmd_update(SimpleNamespace())
+    hermes_main.cmd_update(SimpleNamespace(allow_dirty=False, allow_branch_switch=True))
 
     # Stash should have been restored
     assert len(restore_calls) == 1
@@ -545,7 +683,7 @@ def test_cmd_update_no_checkout_when_already_on_main(monkeypatch, tmp_path):
     side_effect, recorded = _make_update_side_effect()
     monkeypatch.setattr(hermes_main.subprocess, "run", side_effect)
 
-    hermes_main.cmd_update(SimpleNamespace())
+    hermes_main.cmd_update(SimpleNamespace(allow_dirty=False, allow_branch_switch=True))
 
     checkout_calls = [c for c in recorded if "checkout" in c]
     assert len(checkout_calls) == 0
@@ -566,7 +704,7 @@ def test_cmd_update_network_error_shows_friendly_message(monkeypatch, tmp_path, 
     monkeypatch.setattr(hermes_main.subprocess, "run", side_effect)
 
     with pytest.raises(SystemExit, match="1"):
-        hermes_main.cmd_update(SimpleNamespace())
+        hermes_main.cmd_update(SimpleNamespace(allow_dirty=False, allow_branch_switch=True))
 
     out = capsys.readouterr().out
     assert "Network error" in out
@@ -583,7 +721,7 @@ def test_cmd_update_auth_error_shows_friendly_message(monkeypatch, tmp_path, cap
     monkeypatch.setattr(hermes_main.subprocess, "run", side_effect)
 
     with pytest.raises(SystemExit, match="1"):
-        hermes_main.cmd_update(SimpleNamespace())
+        hermes_main.cmd_update(SimpleNamespace(allow_dirty=False, allow_branch_switch=True))
 
     out = capsys.readouterr().out
     assert "Authentication failed" in out
@@ -598,6 +736,10 @@ def test_cmd_update_skips_stash_restore_when_reset_fails(monkeypatch, tmp_path, 
     _setup_update_mocks(monkeypatch, tmp_path)
     # Re-enable stash so it actually returns a ref
     monkeypatch.setattr(
+        hermes_main, "_get_local_change_lines",
+        lambda *a, **kw: [" M cli.py"],
+    )
+    monkeypatch.setattr(
         hermes_main, "_stash_local_changes_if_needed",
         lambda *a, **kw: "abc123deadbeef",
     )
@@ -611,7 +753,7 @@ def test_cmd_update_skips_stash_restore_when_reset_fails(monkeypatch, tmp_path, 
     monkeypatch.setattr(hermes_main.subprocess, "run", side_effect)
 
     with pytest.raises(SystemExit, match="1"):
-        hermes_main.cmd_update(SimpleNamespace())
+        hermes_main.cmd_update(SimpleNamespace(allow_dirty=True, allow_branch_switch=True))
 
     # Stash restore should NOT have been called
     assert len(restore_calls) == 0
